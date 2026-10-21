@@ -140,6 +140,27 @@ describe("restricted knowledge reconciliation", () => {
       run([{ ...source, text: "a".repeat(16_001) }])
     ).rejects.toThrow("budget");
     expect(mocks.generate).not.toHaveBeenCalled();
+    expect(mocks.records).not.toHaveBeenCalled();
+  });
+
+  it("finds an older correction target by source relevance instead of its position in the recent page", async () => {
+    mocks.records.mockImplementation((_scope, _key, input) =>
+      Promise.resolve({
+        items: input?.query?.includes("train") ? [record] : [],
+        nextOffset: null,
+      })
+    );
+    mocks.generate.mockResolvedValue({
+      output: { claims: [{ ...claim, replacesId: record.id }] },
+    });
+    const result = await run([{ ...source, text: `Actually, ${text}` }]);
+    expect(result.records[0]).toMatchObject({
+      id: record.id,
+      expectedRevision: record.revision,
+    });
+    const prompt = mocks.generate.mock.calls[0]?.[0].prompt;
+    expect(prompt).toEqual(expect.any(String));
+    expect(prompt).toContain(record.content.body);
   });
 
   it("deduplicates existing facts and rejects malformed structured output", async () => {

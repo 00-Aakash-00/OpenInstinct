@@ -82,7 +82,7 @@ export const memorySources = pgTable(
     observedAt: at("observed_at").notNull(),
     version: integer("version").notNull().default(1),
     status: text("status", {
-      enum: ["pending", "processed", "excluded", "forgotten"],
+      enum: ["pending", "processed", "failed", "excluded", "forgotten"],
     })
       .notNull()
       .default("pending"),

@@ -59,7 +59,7 @@ export async function purgeMemoryContent(
           eq(memorySources.workspaceId, scope.workspaceId),
           eq(memorySources.scopeKey, scopeKey),
           or(
-            eq(memorySources.status, "pending"),
+            inArray(memorySources.status, ["pending", "failed"]),
             and(
               eq(memorySources.kind, "user"),
               eq(memorySources.status, "processed")
@@ -69,7 +69,7 @@ export async function purgeMemoryContent(
         )
       );
     for (const source of pending)
-      if (source.status === "pending" || !supportedSources.has(source.id))
+      if (source.status !== "processed" || !supportedSources.has(source.id))
         sourceIds.add(source.id);
   }
   const affected = new Set(input.recordIds ?? []);

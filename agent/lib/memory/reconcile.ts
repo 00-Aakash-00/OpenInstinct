@@ -26,17 +26,21 @@ export async function reconcileKnowledge(
   sources: Awaited<ReturnType<typeof listMemorySources>>,
   signal: AbortSignal
 ) {
-  const existing = await findMemoryRecords(scope, scopeKey, {});
-  const context: typeof existing.items = [];
-  for (const record of existing.items) {
-    if (JSON.stringify([...context, record]).length > 9_000) break;
-    context.push(record);
-  }
   if (
     sources.reduce((total, source) => total + (source.text?.length ?? 0), 0) >
     16_000
   )
     throw new Error("The memory extraction source budget was exceeded.");
+  const query = sources
+    .map((source) => source.text ?? "")
+    .join("\n")
+    .slice(0, 200);
+  const existing = await findMemoryRecords(scope, scopeKey, { query });
+  const context: typeof existing.items = [];
+  for (const record of existing.items) {
+    if (JSON.stringify([...context, record]).length > 9_000) break;
+    context.push(record);
+  }
   const result = await generateText({
     model: await getGatewayModel(scope),
     output: Output.object({ schema: extractionSchema }),

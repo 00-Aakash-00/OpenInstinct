@@ -53,14 +53,21 @@ index. Browser subagents do not inherit the knowledge store.
 2. A minutely Eve schedule claims durable PostgreSQL jobs. A restricted structured
    model call proposes exact source quotations; server code validates sources,
    offsets, revisions, ownership and deletion state before publishing anything.
+   Relevant existing records are selected from source text under a bounded
+   context budget.
    Authentication and input-request events disable capture for that chat. This
    conservative boundary includes ordinary clarification requests: subsequently,
    save or correct facts in a fresh chat or on the Memory page. Obvious credentials
    and explicitly excluded input are rejected earlier.
    Pattern checks supplement those typed boundaries; they are not a universal
    secret detector.
-   Disabling capture also revokes captured chat evidence and records derived from
-   it, including earlier explicit chat memories; Memory-page edits remain separate.
+   Disabling capture revokes evidence from the requesting turn and any inputs
+   received at or after that request, along with records derived from that
+   evidence. Earlier independent memories survive; Memory-page edits remain
+   separate. Recovery applies the original request boundary even when capture
+   is already disabled.
+   At the end of a turn, unused explicit-control inputs are discarded unless a
+   saved record or revision cites them. Recovery also repairs missed cleanup.
 3. Records and revisions are authoritative in PostgreSQL. Explicit edits publish
    immediately. Background publication uses leases, checkpoints, source versions
    and deletion epochs. Private immutable Markdown uploads have a reservation
@@ -129,8 +136,9 @@ same flow with real model replies. Run it repeatedly before expanding rollout;
 passing deterministic tests is not a measurement of model recall quality.
 
 Maintenance is bounded by batch size, model timeout, output-token limit and retry
-count. Processed inputs without supported claims are cleared. Failed or dead-letter
-inputs retain their text until deletion; monitor that backlog during rollout.
+count. Processed inputs without supported claims are cleared. Inputs that exhaust
+their retries discard their text and checkpoint while retaining a non-content
+failure marker, so newer inputs can continue processing.
 Watch pending/dead-letter jobs and artifact purge backlog. Hosting cron
 cadence and model availability determine automatic capture freshness; the system
 does not promise a fixed publication latency or exactly-once model billing.

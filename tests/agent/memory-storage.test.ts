@@ -61,6 +61,7 @@ import {
 } from "@db/services/memory/scope";
 import {
   captureMemorySource,
+  discardUnusedMemoryTurnInputs,
   readMemorySource,
   recordMemoryRecovery,
 } from "@db/services/memory/sources";
@@ -289,7 +290,9 @@ describe("knowledge memory storage", () => {
     await recordMemoryRecovery(alice, key, "alice", {
       expectedCursor: 10,
       nextCursor: 30,
-      captureDisabled: true,
+      captureBoundaries: [
+        { turnId: "recovered", observedAt: new Date().toISOString() },
+      ],
       sources: [source("sensitive-reply")],
     });
     expect(await readMemoryBinding(alice, "alice")).toMatchObject({
@@ -309,6 +312,124 @@ describe("knowledge memory storage", () => {
     await expect(
       editMemoryRecord(alice, key, initial, "editor-after-disable")
     ).resolves.toMatchObject({ explicit: true });
+  });
+
+  it("applies an earlier recovered boundary after capture was already disabled", async () => {
+    const start = Date.now() + 1_000;
+    const observedAt = (offset: number) =>
+      new Date(start + offset).toISOString();
+    await captureMemorySource(
+      alice,
+      key,
+      source("unrelated", "I prefer quiet cars.", observedAt(0))
+    );
+    await captureMemorySource(
+      alice,
+      key,
+      source("earlier-question", "I prefer old context.", observedAt(1_000))
+    );
+    await captureMemorySource(
+      alice,
+      key,
+      source("later-question", "I prefer new context.", observedAt(3_000))
+    );
+    await setMemoryCaptureDisabled(alice, key, "alice", {
+      turnId: "later-question",
+      observedAt: observedAt(4_000),
+    });
+    expect(
+      await readMemorySource(alice, key, "earlier-question")
+    ).not.toBeNull();
+    await recordMemoryRecovery(alice, key, "alice", {
+      expectedCursor: 0,
+      nextCursor: 10,
+      captureBoundaries: [
+        { turnId: "earlier-question", observedAt: observedAt(2_000) },
+      ],
+      sources: [source("late-insert", "I prefer forgotten context.")],
+    });
+    expect(await readMemorySource(alice, key, "unrelated")).not.toBeNull();
+    expect(await readMemorySource(alice, key, "earlier-question")).toBeNull();
+    expect(await readMemorySource(alice, key, "later-question")).toBeNull();
+    expect(await readMemorySource(alice, key, "late-insert")).toBeNull();
+  });
+
+  it("discards unsupported control text while retaining pending inputs and saved revision evidence", async () => {
+    await captureMemorySource(alice, key, source("history"));
+    const first = proposal("history").records[0];
+    if (!first) throw new Error("Expected record.");
+    await saveMemoryRecord(alice, key, first, "first", { sourceId: "history" });
+    await captureMemorySource(
+      alice,
+      key,
+      source("current", "I prefer aisle seats.")
+    );
+    const replacement = proposal("current", "I prefer aisle seats.", "seat", 1)
+      .records[0];
+    if (!replacement) throw new Error("Expected replacement.");
+    await saveMemoryRecord(alice, key, replacement, "replacement", {
+      sourceId: "current",
+    });
+    await captureMemorySource(alice, key, {
+      ...source("unused", "Please update the spreadsheet with this context."),
+      turnId: "history",
+    });
+    await captureMemorySource(alice, key, {
+      ...source("ordinary", "I prefer quiet trains."),
+      turnId: "history",
+    });
+    await captureMemorySource(
+      alice,
+      key,
+      source("unfinished", "Please update the other spreadsheet.")
+    );
+    await discardUnusedMemoryTurnInputs(alice, key, "alice", "history");
+    expect(await readMemorySource(alice, key, "unused")).toBeNull();
+    expect(await readMemorySource(alice, key, "history")).not.toBeNull();
+    expect(await readMemorySource(alice, key, "current")).not.toBeNull();
+    expect(await readMemorySource(alice, key, "ordinary")).toMatchObject({
+      status: "pending",
+    });
+    expect(await readMemorySource(alice, key, "unfinished")).not.toBeNull();
+    const [discarded] = await database
+      .select()
+      .from(schema.memorySources)
+      .where(eq(schema.memorySources.id, "unused"));
+    expect(discarded).toMatchObject({
+      status: "excluded",
+      text: null,
+      reference: null,
+      sessionId: null,
+      turnId: null,
+    });
+  });
+
+  it("repairs unused control cleanup within and across recovery pages and keeps discarded input tombstones", async () => {
+    const input = source("control", "Please update the spreadsheet.");
+    await recordMemoryRecovery(alice, key, "alice", {
+      expectedCursor: 0,
+      nextCursor: 1,
+      sources: [input],
+    });
+    expect(await readMemorySource(alice, key, "control")).not.toBeNull();
+    await recordMemoryRecovery(alice, key, "alice", {
+      expectedCursor: 1,
+      nextCursor: 2,
+      sources: [],
+      finishedTurnIds: ["control"],
+    });
+    expect(await readMemorySource(alice, key, "control")).toBeNull();
+    expect(await captureMemorySource(alice, key, input)).toMatchObject({
+      text: null,
+      status: "excluded",
+    });
+    await recordMemoryRecovery(alice, key, "alice", {
+      expectedCursor: 2,
+      nextCursor: 4,
+      sources: [source("same-page", "Please update another spreadsheet.")],
+      finishedTurnIds: ["same-page"],
+    });
+    expect(await readMemorySource(alice, key, "same-page")).toBeNull();
   });
 
   it("leases one input, checkpoints, atomically publishes supported records and exports, then deduplicates completion", async () => {
@@ -899,7 +1020,10 @@ describe("knowledge memory storage", () => {
     await expect(
       saveMemoryRecord(alice, key, input, "save", { sourceId: "direct" })
     ).resolves.toMatchObject({ explicit: true });
-    await setMemoryCaptureDisabled(alice, key, "alice");
+    await setMemoryCaptureDisabled(alice, key, "alice", {
+      turnId: "direct",
+      observedAt: new Date().toISOString(),
+    });
     expect(await readMemoryRecord(alice, key, "seat")).toBeNull();
   });
 });

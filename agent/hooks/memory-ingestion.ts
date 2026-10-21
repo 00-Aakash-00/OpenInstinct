@@ -2,9 +2,11 @@ import { defineHook, type HookContext } from "eve/hooks";
 import { scopeFromPrincipal } from "@agent/lib/principal-scope";
 import { resolveModeValue } from "@agent/lib/mode";
 import { captureKnowledgeInput } from "@agent/lib/memory/ingest";
+import { discardUnusedMemoryTurnInputs } from "@db/services/memory/sources";
 import {
   readMemoryBinding,
   setMemoryCaptureDisabled,
+  type MemoryCaptureBoundary,
 } from "@db/services/memory/scope";
 import { knowledgeMemoryModeForWorkspace } from "@shared/memory/config";
 
@@ -19,12 +21,33 @@ function interactiveScope(context: HookContext) {
     : null;
 }
 
-async function disableCapture(context: HookContext) {
+async function disableCapture(
+  context: HookContext,
+  boundary: MemoryCaptureBoundary
+) {
   const scope = interactiveScope(context);
   if (!scope) return;
   const binding = await readMemoryBinding(scope, context.session.id);
   if (binding)
-    await setMemoryCaptureDisabled(scope, binding.scopeKey, context.session.id);
+    await setMemoryCaptureDisabled(
+      scope,
+      binding.scopeKey,
+      context.session.id,
+      boundary
+    );
+}
+
+async function finishTurn(context: HookContext, turnId: string) {
+  const scope = interactiveScope(context);
+  if (!scope) return;
+  const binding = await readMemoryBinding(scope, context.session.id);
+  if (binding)
+    await discardUnusedMemoryTurnInputs(
+      scope,
+      binding.scopeKey,
+      context.session.id,
+      turnId
+    );
 }
 
 export default defineHook({
@@ -50,11 +73,26 @@ export default defineHook({
         eventId: event.meta.id,
       });
     },
-    async "authorization.required"(_event, context) {
-      await disableCapture(context);
+    async "authorization.required"(event, context) {
+      await disableCapture(context, {
+        turnId: event.data.turnId,
+        observedAt: event.meta.at,
+      });
     },
-    async "input.requested"(_event, context) {
-      await disableCapture(context);
+    async "input.requested"(event, context) {
+      await disableCapture(context, {
+        turnId: event.data.turnId,
+        observedAt: event.meta.at,
+      });
+    },
+    async "turn.completed"(event, context) {
+      await finishTurn(context, event.data.turnId);
+    },
+    async "turn.failed"(event, context) {
+      await finishTurn(context, event.data.turnId);
+    },
+    async "turn.cancelled"(event, context) {
+      await finishTurn(context, event.data.turnId);
     },
   },
 });

@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNotNull, or } from "drizzle-orm";
 import { z } from "zod";
 import {
   agentSessions,
@@ -15,6 +15,11 @@ import type { AccessScope } from "@shared/identity/access-scope";
 export type MemoryTransaction = Parameters<
   Parameters<typeof db.transaction>[0]
 >[0];
+
+export interface MemoryCaptureBoundary {
+  turnId: string;
+  observedAt: string;
+}
 
 export async function requireMemoryMembership(
   scope: AccessScope,
@@ -210,8 +215,11 @@ export async function disableMemorySessionCapture(
   transaction: MemoryTransaction,
   scope: AccessScope,
   scopeKey: string,
-  sessionId: string
+  sessionId: string,
+  boundary: MemoryCaptureBoundary
 ) {
+  z.string().min(1).parse(boundary.turnId);
+  const observedAt = new Date(z.iso.datetime().parse(boundary.observedAt));
   const [binding] = await transaction
     .select()
     .from(memoryBindings)
@@ -224,7 +232,7 @@ export async function disableMemorySessionCapture(
       )
     )
     .limit(1);
-  if (!binding || binding.captureDisabled) return;
+  if (!binding) return;
   await transaction
     .update(memoryBindings)
     .set({ captureDisabled: true })
@@ -243,9 +251,15 @@ export async function disableMemorySessionCapture(
         eq(memorySources.workspaceId, scope.workspaceId),
         eq(memorySources.scopeKey, scopeKey),
         eq(memorySources.sessionId, sessionId),
-        eq(memorySources.kind, "user")
+        eq(memorySources.kind, "user"),
+        isNotNull(memorySources.text),
+        or(
+          eq(memorySources.turnId, boundary.turnId),
+          gte(memorySources.observedAt, observedAt)
+        )
       )
     );
+  if (sources.length === 0) return;
   await purgeMemoryContent(transaction, scope, scopeKey, {
     sourceIds: sources.map((source) => source.id),
     operationId: `disable:${sessionId}`,
@@ -256,11 +270,18 @@ export async function disableMemorySessionCapture(
 export async function setMemoryCaptureDisabled(
   scope: AccessScope,
   scopeKey: string,
-  sessionId: string
+  sessionId: string,
+  boundary: MemoryCaptureBoundary
 ) {
   await db.transaction(async (transaction) => {
     await lockMemoryState(transaction, scope, scopeKey);
-    await disableMemorySessionCapture(transaction, scope, scopeKey, sessionId);
+    await disableMemorySessionCapture(
+      transaction,
+      scope,
+      scopeKey,
+      sessionId,
+      boundary
+    );
   });
 }
 

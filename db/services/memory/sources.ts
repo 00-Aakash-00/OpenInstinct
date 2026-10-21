@@ -1,11 +1,13 @@
 /* oxlint-disable eslint/no-await-in-loop -- Transaction mutations and validations must follow their dependent writes. */
-import { and, asc, eq, isNotNull } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   agentSessions,
   db,
   memoryBindings,
   memoryJobs,
+  memoryRecords,
+  memoryRevisions,
   memorySources,
   memoryState,
 } from "@db";
@@ -22,6 +24,7 @@ import {
   disableMemorySessionCapture,
   lockMemoryState,
   requireMemoryMembership,
+  type MemoryCaptureBoundary,
   type MemoryTransaction,
 } from "./scope";
 
@@ -251,6 +254,51 @@ export async function readMemorySource(
   return source ?? null;
 }
 
+async function discardUnusedTurnInputs(
+  transaction: MemoryTransaction,
+  scope: AccessScope,
+  scopeKey: string,
+  sessionId: string,
+  turnIds: readonly string[]
+) {
+  if (turnIds.length === 0) return;
+  await transaction
+    .update(memorySources)
+    .set({
+      text: null,
+      reference: null,
+      sessionId: null,
+      turnId: null,
+      status: "excluded",
+    })
+    .where(
+      and(
+        eq(memorySources.workspaceId, scope.workspaceId),
+        eq(memorySources.scopeKey, scopeKey),
+        eq(memorySources.sessionId, sessionId),
+        inArray(memorySources.turnId, [...turnIds]),
+        eq(memorySources.kind, "user"),
+        eq(memorySources.status, "processed"),
+        sql`NOT EXISTS (SELECT 1 FROM ${memoryRecords}, jsonb_array_elements(${memoryRecords.content}->'evidence') AS span WHERE ${memoryRecords.workspaceId} = ${memorySources.workspaceId} AND ${memoryRecords.scopeKey} = ${memorySources.scopeKey} AND span->>'sourceId' = ${memorySources.id})`,
+        sql`NOT EXISTS (SELECT 1 FROM ${memoryRevisions}, jsonb_array_elements(${memoryRevisions.content}->'evidence') AS span WHERE ${memoryRevisions.workspaceId} = ${memorySources.workspaceId} AND ${memoryRevisions.scopeKey} = ${memorySources.scopeKey} AND span->>'sourceId' = ${memorySources.id})`
+      )
+    );
+}
+
+export async function discardUnusedMemoryTurnInputs(
+  scope: AccessScope,
+  scopeKey: string,
+  sessionId: string,
+  turnId: string
+) {
+  await db.transaction(async (transaction) => {
+    await lockMemoryState(transaction, scope, scopeKey);
+    await discardUnusedTurnInputs(transaction, scope, scopeKey, sessionId, [
+      turnId,
+    ]);
+  });
+}
+
 export async function recordMemoryRecovery(
   scope: AccessScope,
   scopeKey: string,
@@ -259,7 +307,8 @@ export async function recordMemoryRecovery(
     expectedCursor: number;
     nextCursor: number;
     sources: readonly MemorySourceInput[];
-    captureDisabled?: boolean;
+    captureBoundaries?: readonly MemoryCaptureBoundary[];
+    finishedTurnIds?: readonly string[];
   }
 ) {
   z.number().int().nonnegative().parse(input.expectedCursor);
@@ -281,12 +330,13 @@ export async function recordMemoryRecovery(
       .for("update");
     if (!binding || binding.cursor !== input.expectedCursor)
       throw new Error("The memory recovery cursor changed.");
-    if (input.captureDisabled)
+    for (const boundary of input.captureBoundaries ?? [])
       await disableMemorySessionCapture(
         transaction,
         scope,
         scopeKey,
-        sessionId
+        sessionId,
+        boundary
       );
     const currentState = await lockMemoryState(transaction, scope, scopeKey);
     const inserted = await insertMemorySources(
@@ -294,6 +344,13 @@ export async function recordMemoryRecovery(
       scope,
       scopeKey,
       input.sources
+    );
+    await discardUnusedTurnInputs(
+      transaction,
+      scope,
+      scopeKey,
+      sessionId,
+      input.finishedTurnIds ?? []
     );
     if (inserted.some((source) => source.status === "pending")) {
       await transaction

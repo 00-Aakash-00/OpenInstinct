@@ -174,7 +174,7 @@ describe("knowledge memory recovery route", () => {
       binding.scope,
       "key",
       "session",
-      expect.objectContaining({ sources: [], captureDisabled: true })
+      expect.objectContaining({ sources: [], captureBoundaries: [] })
     );
   });
 
@@ -191,7 +191,7 @@ describe("knowledge memory recovery route", () => {
       "session",
       expect.objectContaining({
         nextCursor: 2,
-        captureDisabled: false,
+        captureBoundaries: [],
         sources: [expect.objectContaining({ text: "I prefer quiet trains." })],
       })
     );
@@ -226,7 +226,44 @@ describe("knowledge memory recovery route", () => {
       expect.objectContaining({
         nextCursor: 2,
         sources: [],
-        captureDisabled: true,
+        captureBoundaries: [
+          { turnId: "earlier", observedAt: "2026-10-20T12:00:00.000Z" },
+        ],
+      })
+    );
+  });
+
+  it("repairs each original boundary even after live capture was disabled", async () => {
+    authenticate();
+    mocks.bindings.mockResolvedValue([{ ...binding, captureDisabled: true }]);
+    await request([
+      {
+        type: "input.requested",
+        data: { requests: [], sequence: 0, stepIndex: 0, turnId: "question" },
+        meta: { id: "question", at: "2026-10-21T12:01:00.000Z" },
+      },
+      {
+        type: "authorization.required",
+        data: {
+          name: "connection",
+          description: "Authorize connection",
+          sequence: 1,
+          stepIndex: 0,
+          turnId: "authorization",
+        },
+        meta: { id: "authorization", at: "2026-10-21T12:02:00.000Z" },
+      },
+    ]);
+    expect(mocks.recover).toHaveBeenCalledWith(
+      binding.scope,
+      "key",
+      "session",
+      expect.objectContaining({
+        sources: [],
+        captureBoundaries: [
+          { turnId: "question", observedAt: "2026-10-21T12:01:00.000Z" },
+          { turnId: "authorization", observedAt: "2026-10-21T12:02:00.000Z" },
+        ],
       })
     );
   });
@@ -238,4 +275,39 @@ describe("knowledge memory recovery route", () => {
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({ scanned: 0, failed: 1 });
   });
+
+  it.each([
+    {
+      type: "turn.completed",
+      data: { sequence: 0, turnId: "turn" },
+      meta: { id: "completed", at: "2026-10-21T12:01:00.000Z" },
+    },
+    {
+      type: "turn.failed",
+      data: {
+        sequence: 0,
+        turnId: "turn",
+        code: "MODEL_FAILURE",
+        message: "The turn failed.",
+      },
+      meta: { id: "failed", at: "2026-10-21T12:01:00.000Z" },
+    },
+    {
+      type: "turn.cancelled",
+      data: { sequence: 0, turnId: "turn" },
+      meta: { id: "cancelled", at: "2026-10-21T12:01:00.000Z" },
+    },
+  ] satisfies MessageStreamEvent[])(
+    "repairs unused control cleanup after $type",
+    async (event) => {
+      authenticate();
+      await request([userMessage("Please update the spreadsheet."), event]);
+      expect(mocks.recover).toHaveBeenCalledWith(
+        binding.scope,
+        "key",
+        "session",
+        expect.objectContaining({ finishedTurnIds: ["turn"] })
+      );
+    }
+  );
 });

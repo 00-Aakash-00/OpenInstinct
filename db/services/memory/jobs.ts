@@ -134,6 +134,8 @@ export async function claimMemoryJob(
           leaseExpiresAt: null,
         })
         .where(eq(memoryJobs.id, job.id));
+      if (job.attempts >= 5 && job.epoch === state.deletionEpoch)
+        await failMemoryJobSources(transaction, scope, scopeKey, job);
       return null;
     }
     const sources = await transaction
@@ -567,7 +569,10 @@ export async function releaseMemoryJob(
     await transaction
       .update(memoryJobs)
       .set({
-        checkpoint: options.discardCheckpoint ? null : job.checkpoint,
+        checkpoint:
+          job.attempts >= 5 || options.discardCheckpoint
+            ? null
+            : job.checkpoint,
         sourceVersions: options.discardCheckpoint ? [] : job.sourceVersions,
         status: job.attempts >= 5 ? "dead_letter" : "pending",
         availableAt: new Date(
@@ -583,6 +588,8 @@ export async function releaseMemoryJob(
           eq(memoryJobs.id, job.id)
         )
       );
+    if (job.attempts >= 5)
+      await failMemoryJobSources(transaction, scope, scopeKey, job);
     await transaction
       .update(memoryArtifacts)
       .set({ status: "purge" })
@@ -595,4 +602,44 @@ export async function releaseMemoryJob(
         )
       );
   });
+}
+
+async function failMemoryJobSources(
+  transaction: MemoryTransaction,
+  scope: AccessScope,
+  scopeKey: string,
+  job: typeof memoryJobs.$inferSelect
+) {
+  for (const source of job.sourceVersions)
+    await transaction
+      .update(memorySources)
+      .set({
+        status: "failed",
+        text: null,
+        reference: null,
+        sessionId: null,
+        turnId: null,
+      })
+      .where(
+        and(
+          eq(memorySources.workspaceId, scope.workspaceId),
+          eq(memorySources.scopeKey, scopeKey),
+          eq(memorySources.id, source.id),
+          eq(memorySources.version, source.version),
+          eq(memorySources.status, "pending")
+        )
+      );
+  const [pending] = await transaction
+    .select({ id: memorySources.id })
+    .from(memorySources)
+    .where(
+      and(
+        eq(memorySources.workspaceId, scope.workspaceId),
+        eq(memorySources.scopeKey, scopeKey),
+        eq(memorySources.status, "pending"),
+        isNotNull(memorySources.text)
+      )
+    )
+    .limit(1);
+  if (pending) await enqueueMemoryJob(transaction, scope, scopeKey, job.epoch);
 }

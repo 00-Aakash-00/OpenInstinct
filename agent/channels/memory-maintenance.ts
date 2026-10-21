@@ -62,7 +62,6 @@ async function recoverSession(
         expectedCursor: binding.cursor,
         nextCursor: binding.cursor,
         sources: [],
-        captureDisabled: binding.captureDisabled,
       }
     );
     return;
@@ -86,13 +85,20 @@ async function recoverSession(
   const eligible = events.filter(
     (event) => new Date(event.meta.at) >= binding.captureAfter
   );
+  const captureBoundaries = events.flatMap((event) =>
+    event.type === "authorization.required" || event.type === "input.requested"
+      ? [{ turnId: event.data.turnId, observedAt: event.meta.at }]
+      : []
+  );
   const captureDisabled =
-    binding.captureDisabled ||
-    events.some(
-      (event) =>
-        event.type === "authorization.required" ||
-        event.type === "input.requested"
-    );
+    binding.captureDisabled || captureBoundaries.length > 0;
+  const finishedTurnIds = events.flatMap((event) =>
+    event.type === "turn.completed" ||
+    event.type === "turn.failed" ||
+    event.type === "turn.cancelled"
+      ? [event.data.turnId]
+      : []
+  );
   const sources = captureDisabled
     ? []
     : eligible.flatMap((event) => {
@@ -121,7 +127,8 @@ async function recoverSession(
       expectedCursor: binding.cursor,
       nextCursor: binding.cursor + events.length,
       sources,
-      captureDisabled,
+      captureBoundaries,
+      finishedTurnIds,
     }
   );
 }

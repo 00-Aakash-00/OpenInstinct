@@ -66,7 +66,12 @@ afterAll(async () => {
   await client.close();
 });
 
-function context(sessionId: string, input = "", authenticator = "authjs") {
+function context(
+  sessionId: string,
+  input = "",
+  authenticator = "authjs",
+  turnId = "turn"
+) {
   return {
     abortSignal: new AbortController().signal,
     model: null,
@@ -96,7 +101,7 @@ function context(sessionId: string, input = "", authenticator = "authjs") {
     ],
     operationId: `${sessionId}-recall`,
     session: {
-      turn: { id: "turn", sequence: 1 },
+      turn: { id: turnId, sequence: 1 },
       id: sessionId,
       auth: {
         current: {
@@ -109,7 +114,7 @@ function context(sessionId: string, input = "", authenticator = "authjs") {
       },
     },
     turn: {
-      id: "turn",
+      id: turnId,
       input: input
         ? [
             Object.assign(
@@ -124,7 +129,10 @@ function context(sessionId: string, input = "", authenticator = "authjs") {
     MemoryToolsContext &
     Omit<ToolContext, "callId" | "toolName">;
 }
-async function receive(current: ReturnType<typeof context>) {
+async function receive(
+  current: ReturnType<typeof context>,
+  observedAt = new Date().toISOString()
+) {
   const message = directKnowledgeInputs(current.turn.input).join("\n");
   const handler = ingestion.events?.["message.received"];
   if (!handler) throw new Error("Expected receipt hook.");
@@ -138,7 +146,7 @@ async function receive(current: ReturnType<typeof context>) {
       },
       meta: {
         id: `receipt-${current.session.id}`,
-        at: new Date().toISOString(),
+        at: observedAt,
       },
     },
     { ...current, agent: { name: "root" } }
@@ -166,6 +174,106 @@ async function remember() {
 }
 
 describe("knowledge memory across fresh agent contexts", () => {
+  it.each(["authorization.required", "input.requested"] as const)(
+    "preserves earlier explicit memories when %s excludes the current exchange",
+    async (eventType) => {
+      const start = Date.now() + 1_000;
+      const facts = await Promise.all(
+        ["earlier-one", "earlier-two", "requesting-turn", "racing-reply"].map(
+          async (turnId, index) => {
+            const body = `I prefer the ${turnId} option.`;
+            const current = context(
+              "first",
+              `Please remember: ${body}`,
+              "authjs",
+              turnId
+            );
+            const tools = await knowledge.provider.tools(current);
+            if (!tools) throw new Error("Expected knowledge tools.");
+            await receive(
+              current,
+              new Date(start + index * 1_000).toISOString()
+            );
+            const saved = await tools.remember.execute(
+              { kind: "preference", body },
+              { ...current, callId: turnId, toolName: "knowledge__remember" }
+            );
+            if (!("id" in saved)) throw new Error("Expected a saved record.");
+            return saved.id;
+          }
+        )
+      );
+      const current = {
+        ...context("first", "", "authjs", "different-context-turn"),
+        agent: { name: "root" },
+      };
+      const event = {
+        data: { sequence: 1, stepIndex: 0, turnId: "requesting-turn" },
+        meta: {
+          id: "capture-boundary",
+          at: new Date(start + 2_500).toISOString(),
+        },
+      };
+      if (eventType === "input.requested") {
+        await ingestion.events?.[eventType]?.(
+          {
+            ...event,
+            type: eventType,
+            data: { ...event.data, requests: [] },
+          },
+          current
+        );
+      } else {
+        await ingestion.events?.[eventType]?.(
+          {
+            ...event,
+            type: eventType,
+            data: {
+              ...event.data,
+              name: "connection",
+              description: "Authorize connection",
+            },
+          },
+          current
+        );
+      }
+      const records = await Promise.all(
+        facts.map((id) => readMemoryRecord(scope, "key", id))
+      );
+      expect(records.slice(0, 2).every((record) => record?.explicit)).toBe(
+        true
+      );
+      expect(records.slice(2)).toEqual([null, null]);
+      expect(await readMemoryBinding(scope, "first")).toMatchObject({
+        captureDisabled: true,
+      });
+      await receive(context("first", "MangoTreeIsMySecret", "authjs", "later"));
+      expect(
+        (await listMemorySources(scope, "key"))
+          .map((source) => source.turnId ?? "")
+          .toSorted((left, right) => left.localeCompare(right))
+      ).toEqual(["earlier-one", "earlier-two"]);
+    }
+  );
+
+  it("cleans up unused control input when its original turn completes", async () => {
+    const current = context("first", "Please update the spreadsheet.");
+    await toolsFor(current);
+    expect(await listMemorySources(scope, "key")).toHaveLength(1);
+    await ingestion.events?.["turn.completed"]?.(
+      {
+        type: "turn.completed",
+        data: { sequence: 1, turnId: current.turn.id },
+        meta: { id: "completed", at: new Date().toISOString() },
+      },
+      {
+        ...context("first", "", "authjs", "different-context-turn"),
+        agent: { name: "root" },
+      }
+    );
+    expect(await listMemorySources(scope, "key")).toEqual([]);
+  });
+
   it("never invents a receipt time for an old uncaptured turn", async () => {
     const stale = context("first", "Please remember I prefer old preferences.");
     const tools = await knowledge.provider.tools(stale);
@@ -353,7 +461,10 @@ describe("knowledge memory across fresh agent contexts", () => {
         { ...current, callId: "fabricated", toolName: "knowledge__remember" }
       )
     ).rejects.toThrow("explicit current user request");
-    await setMemoryCaptureDisabled(scope, "key", "first");
+    await setMemoryCaptureDisabled(scope, "key", "first", {
+      turnId: current.turn.id,
+      observedAt: new Date().toISOString(),
+    });
     const request = context("first", "Remember that I prefer red.");
     const disabledTools = await toolsFor(request);
     if (!disabledTools) throw new Error("Expected tools.");
