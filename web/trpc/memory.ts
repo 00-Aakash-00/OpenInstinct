@@ -12,6 +12,8 @@ import {
   memoryRecordHistory,
   readMemoryRecord,
 } from "@db/services/memory/records";
+import { readMemoryHealth } from "@db/services/memory/health";
+import { readMemoryModelUsage } from "@db/services/memory/usage";
 import { knowledgeMemoryModeForWorkspace } from "@shared/memory/config";
 import {
   editMemoryRecordSchema,
@@ -57,6 +59,15 @@ export const memoryRouter = createTRPCRouter({
       updatedAt: binding.updatedAt.toISOString(),
     }));
   }),
+  status: scopedMemoryProcedure
+    .input(z.strictObject(sessionInput.shape))
+    .query(async ({ ctx }) => {
+      const [health, usage] = await Promise.all([
+        readMemoryHealth(ctx.scope, ctx.memoryScopeKey),
+        readMemoryModelUsage(ctx.scope),
+      ]);
+      return { ...health, usage };
+    }),
   list: scopedMemoryProcedure
     .input(findMemoryRecordsSchema.extend(sessionInput.shape))
     .query(({ ctx, input }) => {

@@ -18,6 +18,9 @@ Apply the committed migrations with `pnpm db:migrate`, then configure:
 KNOWLEDGE_MEMORY_MODE=shadow
 # Optional: comma-separated authenticated workspace IDs. Omit for all workspaces.
 KNOWLEDGE_MEMORY_WORKSPACES=personal:your-workspace-id
+# Daily limits per workspace, shared across its memory scopes (UTC).
+KNOWLEDGE_MEMORY_DAILY_TOKENS=250000
+KNOWLEDGE_MEMORY_DAILY_CALLS=100
 ```
 
 - `off`: preserves legacy behavior for workspaces that have not migrated. No new
@@ -74,6 +77,11 @@ index. Browser subagents do not inherit the knowledge store.
    ledger, so abandoned uploads can be collected. Storage failures do not expose
    partial generations.
 4. Recall supplies a bounded profile/current-context bundle and selected records.
+   Each projection fits 6,000 UTF-8 bytes after JSON escaping; the complete
+   knowledge recall message, including instructions, fits 17,500 bytes. Whole
+   records that do not fit are skipped, leaving room for smaller candidates.
+   These are byte limits, not exact model-token counts; other memory providers
+   and the conversation have separate context costs.
    Search, read, one-hop links and history return scoped evidence. Stable recall
    IDs replace old bundles even when empty. Operation receipts preserve exact
    replay; erased receipts reject replay and require a new turn.
@@ -119,26 +127,91 @@ or Blob snapshots independently of deletion state. Roll back with the feature
 flag while keeping the migration-aware code deployed. Drain sessions running an
 older deployment before enabling cutover.
 
-## Validation and operation
+## Usage budgets and operation
+
+Daily extraction defaults are 250,000 charged tokens and 100 model calls per
+workspace, shared across its memory scopes. Either limit set to zero pauses
+model extraction. A transaction reserves capacity before every call, including
+retries, so concurrent workers cannot independently spend the same allowance.
+The UTC date at reservation determines the accounting day, even if a call
+finishes after midnight.
+
+The reservation uses the UTF-8 byte length of the instructions, prompt and output
+schema, plus the 3,000-token output limit and a 1,024-token framing allowance.
+This is a conservative admission estimate, not a tokenizer or a dollar cap.
+Reported provider usage replaces the reservation once, including failed calls
+with complete usage. Missing or partial usage, timeouts without complete usage
+and abandoned calls retain at least the reservation. Reported overruns
+are charged and block subsequent admission. Provider billing can therefore exceed
+the estimate; this is not a guarantee of an exact spending ceiling.
+
+Exhausted budgets defer extraction until the next UTC day without consuming a
+retry. A request larger than an entire positive daily token allowance is rejected
+without a model call: its unsupported pending text is discarded, a failure marker
+prevents replay, and later inputs can proceed. Explicitly saved evidence survives.
+The original chat remains outside this cleanup. Zero budgets preserve queued
+input. Raising a limit takes effect for new claims; already deferred extraction
+remains scheduled for its recorded retry time.
+
+Explicit edits, legacy import, export publication, forgetting and artifact purge
+do not need extraction budget. An explicit change wakes deferred work to publish
+its export. The non-content usage ledger retains model IDs, attempts, reported
+usage and accepted-proposal counts after a record is forgotten; deleting the
+workspace removes it. It never stores prompts, source text or model output.
+
+The authenticated `memory.status` query accepts an owned `sessionId`, like the
+other memory queries. It returns scoped source/job/artifact counts and oldest
+timestamps, the latest generation time, and workspace-wide daily usage. Usage
+includes outstanding reservations, unknown charges, retry costs and calls that
+accepted no proposals. Those counts are operational evidence, not answer-quality
+scores. Monitor pending/dead-letter jobs, queue age and artifact purge backlog.
+Hosting cadence and model availability determine automatic capture freshness;
+the system does not promise a fixed publication latency or exactly-once billing.
+
+## Validation
 
 ```bash
 pnpm check
 pnpm build
 pnpm test:runtime
+pnpm bench:memory:scenarios
+pnpm bench:memory:scale
 # Requires AI Gateway credentials; uses fresh sessions and semantic grading.
 KNOWLEDGE_MEMORY_MODE=enabled pnpm eval:agent --tag knowledge-memory
 ```
 
 The deterministic suites exercise scoped remember → correct → recall → forget,
 source validation, revision conflicts, source recovery, replay, migration,
-deletion fencing and failed publication. The opt-in live evaluation checks the
-same flow with real model replies. Run it repeatedly before expanding rollout;
-passing deterministic tests is not a measurement of model recall quality.
+deletion fencing and failed publication. The scenario runner executes 40 frozen
+evidence gates three times in isolated database state and writes a JSON report to
+`.eve/benchmarks/memory-scenarios.json` (override with `--output path`). Model
+extraction, Blob and recovery HTTP boundaries use fixtures. Semantic answer quality
+and a live-model comparison with the pinned legacy baseline remain unmeasured;
+unsupported baseline APIs are reported separately from shared behavior not run.
 
-Maintenance is bounded by batch size, model timeout, output-token limit and retry
-count. Processed inputs without supported claims are cleared. Inputs that exhaust
-their retries discard their text and checkpoint while retaining a non-content
-failure marker, so newer inputs can continue processing.
-Watch pending/dead-letter jobs and artifact purge backlog. Hosting cron
-cadence and model availability determine automatic capture freshness; the system
-does not promise a fixed publication latency or exactly-once model billing.
+The opt-in scale runner uses three fresh PGlite processes with 1,000 synthetic
+records, multilingual text, older relevant records and one-hop links. It records
+first-call latency and 30 warm samples per operation, p50/p95, serialized bytes,
+source hashes and runtime metadata under `.eve/memory-scale` (override with one
+output-directory argument). It exercises the installed Eve file-memory provider
+as a constrained baseline, recording its entry/document limits rather than
+silently shrinking a dataset and calling the results equivalent. Local database
+timings do not establish hosted PostgreSQL, network or model latency.
+
+Two opt-in live evaluations repeat the explicit remember/correct/recall/forget
+flow and the automatic capture/maintenance/fresh-session recall flow three times
+each. They wait for observed publication, use isolated scenarios and clean up
+their saved records. Run them with configured credentials before expanding
+rollout. Passing deterministic checks is not a measurement of model recall quality.
+
+After the live evaluation workers stop, the supervisor cleans only their
+synthetic workspace's artifact ledger before deleting the disposable database.
+Cleanup respects the five-minute reservation grace. If cleanup fails or the run
+is interrupted after migration, the database and volume are retained with a
+retry command so the purge ledger is not lost. This may add several minutes to
+live evaluation teardown; it does not validate hosted storage until actually run.
+
+Maintenance also has batch, timeout, output and retry bounds. Processed inputs
+without supported claims are cleared. Inputs that exhaust retries discard their
+text and checkpoint while retaining a non-content marker, allowing newer inputs
+to proceed.

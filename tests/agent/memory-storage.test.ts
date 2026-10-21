@@ -469,6 +469,23 @@ describe("knowledge memory storage", () => {
 
   it("rejects invented claims, out-of-claim evidence and autonomous overwrite of explicit correction", async () => {
     await editMemoryRecord(alice, key, initial, "explicit");
+    const exported = await claim();
+    const file = artifact(exported);
+    await registerMemoryJobArtifacts(
+      alice,
+      key,
+      exported.id,
+      exported.leaseToken,
+      [file]
+    );
+    await publishMemoryJob(alice, key, {
+      jobId: exported.id,
+      leaseToken: exported.leaseToken,
+      expectedEpoch: exported.epoch,
+      records: [],
+      links: [],
+      artifacts: [file],
+    });
     await captureMemorySource(
       alice,
       key,

@@ -138,7 +138,7 @@ export async function claimMemoryJob(
         await failMemoryJobSources(transaction, scope, scopeKey, job);
       return null;
     }
-    const sources = await transaction
+    let sources = await transaction
       .select()
       .from(memorySources)
       .where(
@@ -162,6 +162,7 @@ export async function claimMemoryJob(
       scope,
       scopeKey
     );
+    if (exportRecords.length && !job.checkpoint) sources = [];
     if (!sources.length && !exportRecords.length) {
       await transaction
         .update(memoryJobs)
@@ -191,7 +192,7 @@ export async function claimMemoryJob(
   });
 }
 
-export async function requireMemoryJobLease(
+async function readMemoryJobLease(
   transaction: MemoryTransaction,
   scope: AccessScope,
   scopeKey: string,
@@ -223,6 +224,25 @@ export async function requireMemoryJobLease(
     throw new Error(
       "The memory maintenance lease or deletion epoch is no longer valid."
     );
+  return job;
+}
+
+export async function requireMemoryJobLease(
+  transaction: MemoryTransaction,
+  scope: AccessScope,
+  scopeKey: string,
+  jobId: string,
+  leaseToken: string,
+  expectedEpoch?: number
+) {
+  const job = await readMemoryJobLease(
+    transaction,
+    scope,
+    scopeKey,
+    jobId,
+    leaseToken,
+    expectedEpoch
+  );
   for (const reference of job.sourceVersions) {
     const [source] = await transaction
       .select()
@@ -543,6 +563,71 @@ async function findUnpublishedMemoryRecords(
   );
 }
 
+export async function rejectMemoryJob(
+  scope: AccessScope,
+  scopeKey: string,
+  jobId: string,
+  leaseToken: string
+) {
+  await db.transaction(async (transaction) => {
+    const job = await readMemoryJobLease(
+      transaction,
+      scope,
+      scopeKey,
+      jobId,
+      leaseToken
+    );
+    if (job.checkpoint)
+      throw new Error(
+        "A checkpointed memory job does not need a model budget."
+      );
+    await transaction
+      .update(memoryJobs)
+      .set({
+        status: "dead_letter",
+        checkpoint: null,
+        sourceVersions: [],
+        leaseToken: null,
+        leaseExpiresAt: null,
+      })
+      .where(eq(memoryJobs.id, job.id));
+    await failMemoryJobSources(transaction, scope, scopeKey, job);
+  });
+}
+
+export async function deferMemoryJob(
+  scope: AccessScope,
+  scopeKey: string,
+  jobId: string,
+  leaseToken: string,
+  availableAt: Date
+) {
+  await db.transaction(async (transaction) => {
+    const job = await readMemoryJobLease(
+      transaction,
+      scope,
+      scopeKey,
+      jobId,
+      leaseToken
+    );
+    if (job.checkpoint)
+      throw new Error(
+        "A checkpointed memory job does not need a model budget."
+      );
+    await transaction
+      .update(memoryJobs)
+      .set({
+        status: "pending",
+        attempts: Math.max(0, job.attempts - 1),
+        availableAt,
+        leaseToken: null,
+        leaseExpiresAt: null,
+        sourceVersions: [],
+      })
+      .where(eq(memoryJobs.id, jobId));
+  });
+}
+
 export async function releaseMemoryJob(
   scope: AccessScope,
   scopeKey: string,
@@ -626,7 +711,9 @@ async function failMemoryJobSources(
           eq(memorySources.scopeKey, scopeKey),
           eq(memorySources.id, source.id),
           eq(memorySources.version, source.version),
-          eq(memorySources.status, "pending")
+          eq(memorySources.status, "pending"),
+          sql`NOT EXISTS (SELECT 1 FROM ${memoryRecords}, jsonb_array_elements(${memoryRecords.content}->'evidence') AS span WHERE ${memoryRecords.workspaceId} = ${memorySources.workspaceId} AND ${memoryRecords.scopeKey} = ${memorySources.scopeKey} AND span->>'sourceId' = ${memorySources.id})`,
+          sql`NOT EXISTS (SELECT 1 FROM ${memoryRevisions}, jsonb_array_elements(${memoryRevisions.content}->'evidence') AS span WHERE ${memoryRevisions.workspaceId} = ${memorySources.workspaceId} AND ${memoryRevisions.scopeKey} = ${memorySources.scopeKey} AND span->>'sourceId' = ${memorySources.id})`
         )
       );
   const [pending] = await transaction

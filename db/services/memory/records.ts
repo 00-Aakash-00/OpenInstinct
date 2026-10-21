@@ -289,7 +289,8 @@ export async function saveMemoryRecord(
         transaction,
         scope,
         scopeKey,
-        generation.deletionEpoch
+        generation.deletionEpoch,
+        true
       );
     }
     return recordResult(record);
@@ -353,7 +354,8 @@ export async function editMemoryRecord(
         transaction,
         scope,
         scopeKey,
-        generation.deletionEpoch
+        generation.deletionEpoch,
+        true
       );
     }
     return recordResult(record);

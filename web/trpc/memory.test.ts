@@ -11,11 +11,15 @@ import type {
   memoryRecordHistory,
   readMemoryRecord,
 } from "@db/services/memory/records";
+import type { readMemoryHealth } from "@db/services/memory/health";
+import type { readMemoryModelUsage } from "@db/services/memory/usage";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { memoryRouter } from "./memory";
 
 const mocks = vi.hoisted(() => ({
   mode: vi.fn<typeof knowledgeMemoryModeForWorkspace>(),
+  health: vi.fn<typeof readMemoryHealth>(),
+  usage: vi.fn<typeof readMemoryModelUsage>(),
   bindings: {
     listMemoryBindings: vi.fn<typeof listMemoryBindings>(),
     readMemoryBinding: vi.fn<typeof readMemoryBinding>(),
@@ -34,6 +38,12 @@ vi.mock("@shared/memory/config", () => ({
 }));
 vi.mock("@db/services/memory/scope", () => mocks.bindings);
 vi.mock("@db/services/memory/records", () => mocks.records);
+vi.mock("@db/services/memory/health", () => ({
+  readMemoryHealth: mocks.health,
+}));
+vi.mock("@db/services/memory/usage", () => ({
+  readMemoryModelUsage: mocks.usage,
+}));
 
 const scope = { userId: "owner", workspaceId: "workspace" };
 const caller = () =>
@@ -87,8 +97,15 @@ describe("memory router scope and controls", () => {
     await expect(caller().save(record)).rejects.toMatchObject({
       code: "NOT_FOUND",
     });
+    await expect(
+      caller().status({ sessionId: record.sessionId })
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
     expect(mocks.bindings.listMemoryBindings).not.toHaveBeenCalled();
     expect(mocks.records.editMemoryRecord).not.toHaveBeenCalled();
+    expect(mocks.health).not.toHaveBeenCalled();
+    expect(mocks.usage).not.toHaveBeenCalled();
   });
 
   it("returns only owned chat references to the browser", async () => {
@@ -116,7 +133,25 @@ describe("memory router scope and controls", () => {
     await expect(
       caller().read({ sessionId: "another-users-chat", id: "record-1" })
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(
+      caller().status({ sessionId: "another-users-chat" })
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(mocks.records.readMemoryRecord).not.toHaveBeenCalled();
+    expect(mocks.health).not.toHaveBeenCalled();
+    expect(mocks.usage).not.toHaveBeenCalled();
+  });
+
+  it("scopes operational counts to the owned binding and usage to its workspace", async () => {
+    await caller().status({ sessionId: record.sessionId });
+    const untrusted = { sessionId: record.sessionId, workspaceId: "other" };
+    await expect(caller().status(untrusted)).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
+    expect(mocks.health).toHaveBeenCalledExactlyOnceWith(
+      scope,
+      "trusted-eve-scope"
+    );
+    expect(mocks.usage).toHaveBeenCalledExactlyOnceWith(scope);
   });
 
   it("rejects client supplied scope and owner fields", async () => {

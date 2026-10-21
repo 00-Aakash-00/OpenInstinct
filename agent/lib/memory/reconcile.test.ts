@@ -1,6 +1,8 @@
 import type * as Ai from "ai";
+import { NoObjectGeneratedError } from "ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { findMemoryRecords } from "@db/services/memory/records";
+import type * as Usage from "@db/services/memory/usage";
 import type { listMemorySources } from "@db/services/memory/sources";
 
 const mocks = vi.hoisted(() => ({
@@ -8,18 +10,22 @@ const mocks = vi.hoisted(() => ({
     vi.fn<
       (
         input: Parameters<typeof Ai.generateText>[0]
-      ) => Promise<{ output: unknown }>
+      ) => Promise<{ output: unknown; usage?: Ai.LanguageModelUsage }>
     >(),
   records: vi.fn<typeof findMemoryRecords>(),
+  reserve: vi.fn<typeof Usage.reserveMemoryModelUsage>(),
+  complete: vi.fn<typeof Usage.completeMemoryModelUsage>(),
 }));
 vi.mock("ai", async (importOriginal) => ({
   ...(await importOriginal<typeof Ai>()),
   generateText: mocks.generate,
 }));
+vi.mock("@db/services/memory/usage", () => ({
+  reserveMemoryModelUsage: mocks.reserve,
+  completeMemoryModelUsage: mocks.complete,
+}));
 vi.mock("@db/services/settings", () => ({
-  getGatewayModel: vi
-    .fn<() => Promise<string>>()
-    .mockResolvedValue("test-model"),
+  getGatewayModel: vi.fn<() => Promise<string>>(async () => "test-model"),
 }));
 vi.mock("@db/services/memory/records", () => ({
   findMemoryRecords: mocks.records,
@@ -66,15 +72,147 @@ const record = {
 };
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  vi.resetAllMocks();
   mocks.records.mockResolvedValue({ items: [], nextOffset: null });
   mocks.generate.mockResolvedValue({ output: { claims: [claim] } });
 });
 const run = (
   sources: Awaited<ReturnType<typeof listMemorySources>> = [source]
-) => reconcileKnowledge(scope, "key", sources, new AbortController().signal);
+) =>
+  reconcileKnowledge(scope, "key", sources, new AbortController().signal, {
+    id: "job",
+    leaseToken: "lease",
+  });
 
 describe("restricted knowledge reconciliation", () => {
+  it("reserves before calling the model and settles reported usage", async () => {
+    const usage = {
+      inputTokens: 45,
+      outputTokens: 12,
+      totalTokens: 57,
+      inputTokenDetails: {
+        noCacheTokens: 45,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+      },
+      outputTokenDetails: { textTokens: 12, reasoningTokens: 0 },
+    };
+    mocks.generate.mockResolvedValue({ output: { claims: [claim] }, usage });
+    await run();
+    expect(mocks.reserve.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.generate.mock.invocationCallOrder[0] ?? 0
+    );
+    expect(mocks.reserve).toHaveBeenCalledWith(
+      scope,
+      "key",
+      { id: "job", leaseToken: "lease" },
+      expect.objectContaining({
+        modelId: "test-model",
+      })
+    );
+    expect(mocks.complete).toHaveBeenCalledWith(
+      scope,
+      "key",
+      { id: "job", leaseToken: "lease" },
+      expect.objectContaining({
+        outcome: "succeeded",
+        acceptedClaims: 1,
+        usage,
+      })
+    );
+  });
+
+  it("does not call the model or settle a denied reservation", async () => {
+    mocks.reserve.mockRejectedValue(new Error("budget exhausted"));
+    await expect(run()).rejects.toThrow("budget exhausted");
+    expect(mocks.generate).not.toHaveBeenCalled();
+    expect(mocks.complete).not.toHaveBeenCalled();
+  });
+
+  it("settles known usage when structured output fails validation", async () => {
+    const usage = {
+      inputTokens: 45,
+      outputTokens: 12,
+      totalTokens: 57,
+      inputTokenDetails: {
+        noCacheTokens: 45,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+      },
+      outputTokenDetails: { textTokens: 12, reasoningTokens: 0 },
+    };
+    mocks.generate.mockResolvedValue({ output: { invalid: true }, usage });
+    await expect(run()).rejects.toThrow(/invalid|unrecognized/iu);
+    expect(mocks.complete).toHaveBeenCalledWith(
+      scope,
+      "key",
+      expect.anything(),
+      expect.objectContaining({ outcome: "failed", usage })
+    );
+  });
+
+  it("accounts for an empty accepted proposal independently of model success", async () => {
+    mocks.generate.mockResolvedValue({
+      output: { claims: [{ ...claim, quote: "invented fact" }] },
+    });
+    expect((await run()).records).toEqual([]);
+    expect(mocks.complete).toHaveBeenCalledWith(
+      scope,
+      "key",
+      expect.anything(),
+      expect.objectContaining({ outcome: "succeeded", acceptedClaims: 0 })
+    );
+  });
+
+  it("records SDK error usage when no structured object was generated", async () => {
+    const usage = {
+      inputTokens: 45,
+      outputTokens: 12,
+      totalTokens: 57,
+      inputTokenDetails: {
+        noCacheTokens: 45,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+      },
+      outputTokenDetails: { textTokens: 12, reasoningTokens: 0 },
+    };
+    mocks.generate.mockRejectedValue(
+      new NoObjectGeneratedError({
+        message: "Invalid structured output",
+        usage,
+        text: "invalid",
+        finishReason: "stop",
+        response: {
+          id: "response",
+          modelId: "resolved-model",
+          timestamp: new Date(),
+        },
+      })
+    );
+    await expect(run()).rejects.toThrow("Invalid structured output");
+    expect(mocks.complete).toHaveBeenCalledWith(
+      scope,
+      "key",
+      expect.anything(),
+      expect.objectContaining({
+        outcome: "failed",
+        usage,
+        responseModelId: "resolved-model",
+      })
+    );
+  });
+
+  it("keeps timeout usage unknown instead of refunding a possible provider call", async () => {
+    mocks.generate.mockRejectedValue(new Error("timed out"));
+    await expect(run()).rejects.toThrow("timed out");
+    expect(mocks.complete).toHaveBeenCalledWith(
+      scope,
+      "key",
+      expect.anything(),
+      expect.objectContaining({ outcome: "failed", usage: undefined })
+    );
+  });
+
   it("keeps literal source provenance and stable identities without providing tools", async () => {
     const first = await run();
     expect(await run()).toEqual(first);

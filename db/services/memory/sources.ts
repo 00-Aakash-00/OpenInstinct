@@ -32,7 +32,8 @@ export async function enqueueMemoryJob(
   transaction: MemoryTransaction,
   scope: AccessScope,
   scopeKey: string,
-  epoch: number
+  epoch: number,
+  wakeForExport = false
 ) {
   const [pending] = await transaction
     .select()
@@ -45,7 +46,14 @@ export async function enqueueMemoryJob(
       )
     )
     .limit(1);
-  if (pending) return pending;
+  if (pending) {
+    if (wakeForExport)
+      await transaction
+        .update(memoryJobs)
+        .set({ availableAt: new Date() })
+        .where(eq(memoryJobs.id, pending.id));
+    return pending;
+  }
   const [job] = await transaction
     .insert(memoryJobs)
     .values({

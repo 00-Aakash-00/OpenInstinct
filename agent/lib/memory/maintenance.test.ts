@@ -1,6 +1,10 @@
 import { z } from "zod";
 import type * as Blob from "@vercel/blob";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  MemoryBudgetExceededError,
+  MemoryRequestTooLargeError,
+} from "@db/services/memory/usage";
 import type * as Jobs from "@db/services/memory/jobs";
 import type { followMemoryLinks } from "@db/services/memory/records";
 import type { readMemoryState } from "@db/services/memory/scope";
@@ -16,6 +20,8 @@ const mocks = vi.hoisted(() => ({
   checkpoint: vi.fn<typeof Jobs.checkpointMemoryJob>(),
   publish: vi.fn<typeof Jobs.publishMemoryJob>(),
   release: vi.fn<typeof Jobs.releaseMemoryJob>(),
+  defer: vi.fn<typeof Jobs.deferMemoryJob>(),
+  reject: vi.fn<typeof Jobs.rejectMemoryJob>(),
   reserve: vi.fn<typeof Artifacts.registerMemoryJobArtifacts>(),
   purges: vi.fn<typeof Artifacts.listPendingMemoryBlobPurges>(),
   claimPurge: vi.fn<typeof Artifacts.claimMemoryBlobPurge>(),
@@ -31,6 +37,8 @@ vi.mock("@db/services/memory/jobs", () => ({
   checkpointMemoryJob: mocks.checkpoint,
   publishMemoryJob: mocks.publish,
   releaseMemoryJob: mocks.release,
+  deferMemoryJob: mocks.defer,
+  rejectMemoryJob: mocks.reject,
 }));
 vi.mock("@db/services/memory/artifacts", () => ({
   registerMemoryJobArtifacts: mocks.reserve,
@@ -123,6 +131,73 @@ beforeEach(() => {
 });
 
 describe("durable knowledge maintenance", () => {
+  it("defers budget exhaustion without checkpointing, retrying, or publishing", async () => {
+    const retryAt = new Date("2026-10-22T00:00:00Z");
+    mocks.claim.mockResolvedValue({
+      ...job,
+      exportRecords: [],
+      sources: [
+        {
+          id: "source",
+          workspaceId: scope.workspaceId,
+          scopeKey: "key",
+          kind: "user",
+          text: content.body,
+          reference: null,
+          sessionId: "session",
+          turnId: "turn",
+          observedAt: new Date(),
+          version: 1,
+          status: "pending",
+          createdAt: new Date(),
+        },
+      ],
+    });
+    mocks.extract.mockRejectedValue(new MemoryBudgetExceededError(retryAt));
+    await maintainKnowledge();
+    expect(mocks.defer).toHaveBeenCalledWith(
+      scope,
+      "key",
+      "job",
+      "lease",
+      retryAt
+    );
+    expect(mocks.release).not.toHaveBeenCalled();
+    expect(mocks.checkpoint).not.toHaveBeenCalled();
+    expect(mocks.put).not.toHaveBeenCalled();
+    expect(mocks.publish).not.toHaveBeenCalled();
+  });
+
+  it("rejects an input that cannot fit a positive daily allowance instead of deferring forever", async () => {
+    mocks.claim.mockResolvedValue({
+      ...job,
+      exportRecords: [],
+      sources: [
+        {
+          id: "source",
+          workspaceId: scope.workspaceId,
+          scopeKey: "key",
+          kind: "user",
+          text: content.body,
+          reference: null,
+          sessionId: "session",
+          turnId: "turn",
+          observedAt: new Date(),
+          version: 1,
+          status: "pending",
+          createdAt: new Date(),
+        },
+      ],
+    });
+    mocks.extract.mockRejectedValue(new MemoryRequestTooLargeError());
+    await maintainKnowledge();
+    expect(mocks.reject).toHaveBeenCalledWith(scope, "key", "job", "lease");
+    expect(mocks.defer).not.toHaveBeenCalled();
+    expect(mocks.release).not.toHaveBeenCalled();
+    expect(mocks.checkpoint).not.toHaveBeenCalled();
+    expect(mocks.publish).not.toHaveBeenCalled();
+  });
+
   it("exports authoritative existing links supported by both endpoint records", async () => {
     mocks.links.mockResolvedValue({
       links: [

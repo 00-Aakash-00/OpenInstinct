@@ -123,7 +123,13 @@ export async function importLegacyMemory(
     });
     await publishMemoryGeneration(transaction, scope, scopeKey);
     if (imported)
-      await enqueueMemoryJob(transaction, scope, scopeKey, state.deletionEpoch);
+      await enqueueMemoryJob(
+        transaction,
+        scope,
+        scopeKey,
+        state.deletionEpoch,
+        true
+      );
     return { scopeKey, imported };
   };
   return existingTransaction

@@ -7,10 +7,16 @@ import {
 import {
   claimMemoryJob,
   checkpointMemoryJob,
+  deferMemoryJob,
   listReadyMemoryJobs,
   publishMemoryJob,
+  rejectMemoryJob,
   releaseMemoryJob,
 } from "@db/services/memory/jobs";
+import {
+  MemoryBudgetExceededError,
+  MemoryRequestTooLargeError,
+} from "@db/services/memory/usage";
 import { readMemoryState } from "@db/services/memory/scope";
 import { postMemoryRecovery } from "@agent/lib/schedules/request";
 import { env } from "@shared/environment";
@@ -47,7 +53,7 @@ async function processKnowledgeJob(
     const proposal = job.checkpoint
       ? memoryProposalSchema.parse(job.checkpoint)
       : job.sources.length
-        ? await reconcileKnowledge(scope, scopeKey, job.sources, signal)
+        ? await reconcileKnowledge(scope, scopeKey, job.sources, signal, job)
         : { records: [], links: [] };
     if (!job.checkpoint)
       await checkpointMemoryJob(
@@ -84,7 +90,21 @@ async function processKnowledgeJob(
       expectedGeneration: state.generation,
       artifacts,
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof MemoryRequestTooLargeError) {
+      await rejectMemoryJob(scope, scopeKey, job.id, job.leaseToken);
+      return;
+    }
+    if (error instanceof MemoryBudgetExceededError) {
+      await deferMemoryJob(
+        scope,
+        scopeKey,
+        job.id,
+        job.leaseToken,
+        error.retryAt
+      );
+      return;
+    }
     await releaseMemoryJob(scope, scopeKey, job.id, job.leaseToken, {
       discardCheckpoint: publishing,
     });

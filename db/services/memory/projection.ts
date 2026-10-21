@@ -19,10 +19,11 @@ export function projectRecords(
     for (const row of records) {
       if (!row.content) continue;
       const line = `- [${row.id}] ${row.content.title}: ${row.content.body}`;
-      if (length + line.length + 1 > 6_000) continue;
+      const bytes = Buffer.byteLength(JSON.stringify(line), "utf8");
+      if (length + bytes > 6_000) continue;
       lines.push(line);
       recordIds.push(row.id);
-      length += line.length + 1;
+      length += bytes;
     }
     return lines.join("\n");
   };

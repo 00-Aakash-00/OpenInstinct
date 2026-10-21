@@ -264,3 +264,37 @@ export const memoryArtifacts = pgTable(
     index("memory_artifacts_cleanup_idx").on(table.status, table.createdAt),
   ]
 );
+
+export const memoryModelUsage = pgTable(
+  "memory_model_usage",
+  {
+    ...partition(),
+    jobId: uuid("job_id").notNull(),
+    leaseToken: uuid("lease_token").notNull(),
+    day: text("day").notNull(),
+    modelId: text("model_id").notNull(),
+    attempt: integer("attempt").notNull(),
+    acceptedClaims: integer("accepted_claims"),
+    responseModelId: text("response_model_id"),
+    provider: text("provider"),
+    status: text("status", { enum: ["reserved", "reported", "unknown"] })
+      .notNull()
+      .default("reserved"),
+    outcome: text("outcome", { enum: ["succeeded", "failed"] }),
+    reservedTokens: integer("reserved_tokens").notNull(),
+    chargedTokens: integer("charged_tokens").notNull(),
+    inputTokens: integer("input_tokens"),
+    outputTokens: integer("output_tokens"),
+    totalTokens: integer("total_tokens"),
+    createdAt: at("created_at").notNull().defaultNow(),
+    completedAt: at("completed_at"),
+  },
+  (table) => [
+    primaryKey({ columns: [table.workspaceId, table.jobId, table.leaseToken] }),
+    index("memory_model_usage_day_idx").on(table.workspaceId, table.day),
+    check(
+      "memory_usage_reservation_check",
+      sql`${table.reservedTokens} > 0 AND ${table.chargedTokens} >= 0`
+    ),
+  ]
+);

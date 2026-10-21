@@ -91,6 +91,18 @@ export const env = createEnv({
     LINK_CLIENT_SECRET: requiredValue.optional(),
     KNOWLEDGE_MEMORY_MODE: z.enum(["off", "shadow", "enabled"]).default("off"),
     KNOWLEDGE_MEMORY_WORKSPACES: requiredValue.optional(),
+    KNOWLEDGE_MEMORY_DAILY_TOKENS: z.coerce
+      .number()
+      .int()
+      .min(0)
+      .max(1_000_000_000)
+      .default(250_000),
+    KNOWLEDGE_MEMORY_DAILY_CALLS: z.coerce
+      .number()
+      .int()
+      .min(0)
+      .max(100_000)
+      .default(100),
     STRIPE_PUBLISHABLE_KEY: requiredValue.optional(),
     LINQ_PHONE_NUMBER: requiredValue
       .refine(
